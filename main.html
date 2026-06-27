@@ -1,0 +1,348 @@
+<?php
+/**
+ * Plugin Name: IBD Woo Order CSV Export
+ * Description: Export paid WooCommerce order details as CSV with Jalali date and invoice filters.
+ * Version: 1.9.0
+ */
+
+if (!defined('ABSPATH')) exit;
+
+add_action('admin_menu', function () {
+    add_menu_page(
+        'خروجی سفارشات',
+        'خروجی سفارشات',
+        'manage_woocommerce',
+        'ibd-woo-order-export',
+        'ibd_woo_order_export_page',
+        'dashicons-download',
+        56
+    );
+});
+
+function ibd_paid_statuses() {
+    return array('processing', 'completed');
+}
+
+function ibd_gregorian_to_jalali($gy, $gm, $gd) {
+    $g_d_m = array(0,31,59,90,120,151,181,212,243,273,304,334);
+    $gy2 = ($gm > 2) ? ($gy + 1) : $gy;
+    $days = 355666 + (365 * $gy) + floor(($gy2 + 3) / 4) - floor(($gy2 + 99) / 100) + floor(($gy2 + 399) / 400) + $gd + $g_d_m[$gm - 1];
+
+    $jy = -1595 + 33 * floor($days / 12053);
+    $days %= 12053;
+    $jy += 4 * floor($days / 1461);
+    $days %= 1461;
+
+    if ($days > 365) {
+        $jy += floor(($days - 1) / 365);
+        $days = ($days - 1) % 365;
+    }
+
+    if ($days < 186) {
+        $jm = 1 + floor($days / 31);
+        $jd = 1 + ($days % 31);
+    } else {
+        $jm = 7 + floor(($days - 186) / 30);
+        $jd = 1 + (($days - 186) % 30);
+    }
+
+    return array($jy, $jm, $jd);
+}
+
+function ibd_jalali_to_gregorian($jy, $jm, $jd) {
+    $jy += 1595;
+    $days = -355668 + (365 * $jy) + floor($jy / 33) * 8 + floor((($jy % 33) + 3) / 4) + $jd;
+
+    if ($jm < 7) $days += ($jm - 1) * 31;
+    else $days += (($jm - 7) * 30) + 186;
+
+    $gy = 400 * floor($days / 146097);
+    $days %= 146097;
+
+    if ($days > 36524) {
+        $gy += 100 * floor(--$days / 36524);
+        $days %= 36524;
+        if ($days >= 365) $days++;
+    }
+
+    $gy += 4 * floor($days / 1461);
+    $days %= 1461;
+
+    if ($days > 365) {
+        $gy += floor(($days - 1) / 365);
+        $days = ($days - 1) % 365;
+    }
+
+    $gd = $days + 1;
+    $leap = (($gy % 4 == 0 && $gy % 100 != 0) || ($gy % 400 == 0));
+    $months = array(0,31,($leap ? 29 : 28),31,30,31,30,31,31,30,31,30,31);
+
+    for ($gm = 1; $gm <= 12 && $gd > $months[$gm]; $gm++) {
+        $gd -= $months[$gm];
+    }
+
+    return array($gy, $gm, $gd);
+}
+
+function ibd_jalali_date($timestamp) {
+    $result = ibd_gregorian_to_jalali((int)date('Y', $timestamp), (int)date('m', $timestamp), (int)date('d', $timestamp));
+    return sprintf('%04d/%02d/%02d', $result[0], $result[1], $result[2]);
+}
+
+function ibd_parse_jalali_date_to_mysql($date, $end_of_day = false) {
+    $date = trim(str_replace(array('-', '.'), '/', $date));
+
+    if (!preg_match('/^(\d{4})\/(\d{1,2})\/(\d{1,2})$/', $date, $m)) {
+        return '';
+    }
+
+    $g = ibd_jalali_to_gregorian((int)$m[1], (int)$m[2], (int)$m[3]);
+    $time = $end_of_day ? '23:59:59' : '00:00:00';
+
+    return sprintf('%04d-%02d-%02d %s', $g[0], $g[1], $g[2], $time);
+}
+
+function ibd_woo_order_export_page() {
+    if (!class_exists('WooCommerce')) {
+        echo '<div class="notice notice-error"><p>ووکامرس فعال نیست.</p></div>';
+        return;
+    }
+    ?>
+    <div class="wrap">
+        <h1>خروجی CSV سفارشات پرداخت‌شده</h1>
+
+        <p style="background:#fff;border-right:4px solid #2271b1;padding:12px;">
+            اگر شماره فاکتور وارد شود، فقط همان سفارش خروجی گرفته می‌شود.
+            اگر بازه تاریخ و شماره فاکتور خالی باشد، همه سفارش‌های پرداخت‌شده خروجی گرفته می‌شود.
+        </p>
+
+        <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>">
+            <?php wp_nonce_field('ibd_export_orders_csv'); ?>
+            <input type="hidden" name="action" value="ibd_export_orders_csv">
+
+            <table class="form-table">
+                <tr>
+                    <th>از تاریخ شمسی</th>
+                    <td><input type="text" name="date_from" placeholder="مثلاً 1403/01/01"></td>
+                </tr>
+                <tr>
+                    <th>تا تاریخ شمسی</th>
+                    <td><input type="text" name="date_to" placeholder="مثلاً 1403/01/31"></td>
+                </tr>
+                <tr>
+                    <th>شماره فاکتور</th>
+                    <td><input type="text" name="order_number" placeholder="مثلاً 1234"></td>
+                </tr>
+            </table>
+
+            <p><button type="submit" class="button button-primary">دانلود CSV</button></p>
+        </form>
+
+        <hr>
+        <h2>خلاصه ۱۰ سفارش اخیر پرداخت‌شده</h2>
+        <?php ibd_render_recent_orders_table(); ?>
+    </div>
+    <?php
+}
+
+function ibd_render_recent_orders_table() {
+    $orders = wc_get_orders(array(
+        'limit'   => 10,
+        'orderby' => 'date',
+        'order'   => 'DESC',
+        'status'  => ibd_paid_statuses(),
+    ));
+
+    echo '<table class="widefat striped"><thead><tr>';
+    echo '<th>تاریخ سفارش</th><th>شماره فاکتور</th><th>درگاه پرداخت</th><th>نام مشتری</th><th>کد کالا</th><th>نام کالا</th>';
+    echo '</tr></thead><tbody>';
+
+    if (empty($orders)) {
+        echo '<tr><td colspan="6">سفارشی یافت نشد.</td></tr>';
+    }
+
+    foreach ($orders as $order) {
+        if (!$order || !$order->is_paid()) continue;
+
+        $date = $order->get_date_created() ? ibd_jalali_date($order->get_date_created()->getTimestamp()) : '';
+        $customer_name = trim($order->get_billing_first_name() . ' ' . $order->get_billing_last_name());
+
+        foreach ($order->get_items() as $item) {
+            $product = $item->get_product();
+            $product_code = $product ? ($product->get_sku() ? $product->get_sku() : $product->get_id()) : '';
+
+            echo '<tr>';
+            echo '<td>' . esc_html($date) . '</td>';
+            echo '<td>' . esc_html($order->get_order_number()) . '</td>';
+            echo '<td>' . esc_html($order->get_payment_method_title()) . '</td>';
+            echo '<td>' . esc_html($customer_name) . '</td>';
+            echo '<td>' . esc_html($product_code) . '</td>';
+            echo '<td>' . esc_html($item->get_name()) . '</td>';
+            echo '</tr>';
+        }
+    }
+
+    echo '</tbody></table>';
+}
+
+add_action('admin_post_ibd_export_orders_csv', 'ibd_export_orders_csv');
+
+function ibd_export_orders_csv() {
+    if (!current_user_can('manage_woocommerce')) wp_die('Access denied');
+    if (!class_exists('WooCommerce')) wp_die('WooCommerce is not active');
+
+    check_admin_referer('ibd_export_orders_csv');
+
+    @set_time_limit(300);
+    @ini_set('memory_limit', '512M');
+
+    $date_from = isset($_POST['date_from']) ? sanitize_text_field($_POST['date_from']) : '';
+    $date_to = isset($_POST['date_to']) ? sanitize_text_field($_POST['date_to']) : '';
+    $order_number = isset($_POST['order_number']) ? trim(sanitize_text_field($_POST['order_number'])) : '';
+
+    while (ob_get_level()) {
+        ob_end_clean();
+    }
+
+    header('Content-Type: text/csv; charset=UTF-8');
+    header('Content-Disposition: attachment; filename="woo-paid-orders-export-' . date('Y-m-d-H-i') . '.csv"');
+    header('Pragma: no-cache');
+    header('Expires: 0');
+
+    $output = fopen('php://output', 'w');
+    fprintf($output, chr(0xEF).chr(0xBB).chr(0xBF));
+
+    fputcsv($output, array(
+        'تاریخ سفارش',
+        'شماره فاکتور',
+        'درگاه پرداخت',
+        'شماره تلفن مشتری',
+        'نام مشتری',
+        'نقش',
+        'کدپایه',
+        'Serial',
+        'کد کالا',
+        'نام کالا',
+        'تعداد',
+        'قیمت واحد',
+        'جمع',
+        'راهنما',
+        'فروشنده',
+        'خریدار',
+        'قیمت خرید از ایساتیس',
+    ));
+
+    $args = array(
+        'limit'   => 200,
+        'page'    => 1,
+        'orderby' => 'date',
+        'order'   => 'DESC',
+        'status'  => ibd_paid_statuses(),
+        'return'  => 'objects',
+    );
+
+    if ($date_from || $date_to) {
+        $from = $date_from ? ibd_parse_jalali_date_to_mysql($date_from, false) : '1970-01-01 00:00:00';
+        $to = $date_to ? ibd_parse_jalali_date_to_mysql($date_to, true) : current_time('mysql');
+        $args['date_created'] = $from . '...' . $to;
+    }
+
+    do {
+        $orders = wc_get_orders($args);
+
+        foreach ($orders as $order) {
+            if (!$order || !$order->is_paid()) continue;
+
+            if ($order_number !== '') {
+                if ((string)$order->get_order_number() !== (string)$order_number && (string)$order->get_id() !== (string)$order_number) {
+                    continue;
+                }
+            }
+
+            ibd_write_order_rows($output, $order);
+        }
+
+        $args['page']++;
+
+        if ($order_number !== '' && !empty($orders)) {
+            // برای شماره فاکتور، لازم نیست بی‌نهایت جستجو کند؛ اما اگر افزونه شماره فاکتور جدا دارید، این را برندارید.
+        }
+
+    } while (!empty($orders));
+
+    fclose($output);
+    exit;
+}
+
+function ibd_write_order_rows($output, $order) {
+    $user_id = $order->get_user_id();
+    $user = $user_id ? get_userdata($user_id) : null;
+    $roles = $user ? implode(', ', $user->roles) : '';
+
+    $date = $order->get_date_created() ? ibd_jalali_date($order->get_date_created()->getTimestamp()) : '';
+
+    $customer_name = trim($order->get_billing_first_name() . ' ' . $order->get_billing_last_name());
+    $customer_phone = $order->get_billing_phone();
+
+    $seller = trim($customer_name) === 'فروشگاه ایساتیس' ? 'ایساتیس' : '';
+
+    foreach ($order->get_items() as $item) {
+        $product = $item->get_product();
+
+        $product_id = $product ? $product->get_id() : '';
+        $product_code = $product ? ($product->get_sku() ? $product->get_sku() : $product_id) : '';
+
+        $qty = $item->get_quantity();
+        $line_total = (float) $item->get_total();
+        $unit_price = $qty > 0 ? $line_total / $qty : 0;
+
+        $weight = $product ? (float) $product->get_weight() : 0;
+        $guide = ($weight == 1) ? 1 : '';
+
+        $purchase_price = $product ? $product->get_height() : '';
+
+        fputcsv($output, array(
+            $date,
+            $order->get_order_number(),
+            $order->get_payment_method_title(),
+            $customer_phone,
+            $customer_name,
+            $roles,
+            '',
+            $item->get_meta('_serial'),
+            $product_code,
+            $item->get_name(),
+            $qty,
+            $unit_price,
+            $line_total,
+            $guide,
+            $seller,
+            '',
+            $purchase_price,
+        ));
+    }
+
+    $shipping_total = (float) $order->get_shipping_total();
+
+    if ($shipping_total > 0) {
+        fputcsv($output, array(
+            $date,
+            $order->get_order_number(),
+            $order->get_payment_method_title(),
+            $customer_phone,
+            $customer_name,
+            $roles,
+            1,
+            '',
+            '',
+            'هزینه حمل و نقل',
+            1,
+            $shipping_total,
+            $shipping_total,
+            '',
+            $seller,
+            '',
+            '',
+        ));
+    }
+}
